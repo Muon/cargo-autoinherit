@@ -24,6 +24,9 @@ pub struct AutoInheritConf {
     /// Also move path dependencies to [workspace.dependencies]. By default, path dependencies are left in place.
     #[arg(long)]
     pub include_path_deps: bool,
+    /// Only move dependencies to [workspace.dependencies] if they are shared by at least two workspace members.
+    #[arg(long)]
+    pub shared_only: bool,
 }
 
 #[derive(Debug, Default)]
@@ -156,11 +159,12 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<(), anyhow::Error> {
 
     let include_path_deps = conf.include_path_deps;
     let mut package_name2specs: BTreeMap<String, Action> = BTreeMap::new();
+    let mut dep_usage_count: BTreeMap<String, usize> = BTreeMap::new();
     if let Some(deps) = &mut workspace.dependencies {
         if include_path_deps {
             rewrite_dep_paths_as_absolute(deps.values_mut(), workspace_root);
         }
-        process_deps(deps, &mut package_name2specs, include_path_deps);
+        process_deps(deps, &mut package_name2specs, None, include_path_deps);
     }
 
     for member_id in graph.workspace().member_ids() {
@@ -176,6 +180,7 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<(), anyhow::Error> {
                 .context("Failed to read root manifest")?;
             toml::from_str(&contents).context("Failed to parse root manifest")?
         };
+        let mut crate_shareable_deps: BTreeSet<String> = BTreeSet::new();
         if let Some(deps) = &mut manifest.dependencies {
             if include_path_deps {
                 rewrite_dep_paths_as_absolute(
@@ -183,7 +188,7 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<(), anyhow::Error> {
                     package.manifest_path().parent().unwrap(),
                 );
             }
-            process_deps(deps, &mut package_name2specs, include_path_deps);
+            process_deps(deps, &mut package_name2specs, Some(&mut crate_shareable_deps), include_path_deps);
         }
         if let Some(deps) = &mut manifest.dev_dependencies {
             if include_path_deps {
@@ -192,7 +197,7 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<(), anyhow::Error> {
                     package.manifest_path().parent().unwrap(),
                 );
             }
-            process_deps(deps, &mut package_name2specs, include_path_deps);
+            process_deps(deps, &mut package_name2specs, Some(&mut crate_shareable_deps), include_path_deps);
         }
         if let Some(deps) = &mut manifest.build_dependencies {
             if include_path_deps {
@@ -201,7 +206,10 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<(), anyhow::Error> {
                     package.manifest_path().parent().unwrap(),
                 );
             }
-            process_deps(deps, &mut package_name2specs, include_path_deps);
+            process_deps(deps, &mut package_name2specs, Some(&mut crate_shareable_deps), include_path_deps);
+        }
+        for dep_name in crate_shareable_deps {
+            *dep_usage_count.entry(dep_name).or_default() += 1;
         }
     }
 
@@ -227,6 +235,11 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<(), anyhow::Error> {
                 package_name2inherited_source.insert(package_name, spec);
             }
         }
+    }
+
+    if conf.shared_only {
+        package_name2inherited_source
+            .retain(|name, _| dep_usage_count.get(name).copied().unwrap_or(0) >= 2);
     }
 
     // Add new "shared" dependencies to `[workspace.dependencies]`
@@ -434,11 +447,15 @@ fn insert_preserving_decor(table: &mut toml_edit::Table, key: &str, mut value: t
 fn process_deps(
     deps: &DepsSet,
     package_name2specs: &mut BTreeMap<String, Action>,
+    mut shareable_dep_names: Option<&mut BTreeSet<String>>,
     include_path_deps: bool,
 ) {
     for (name, details) in deps {
         match dep2shared_dep(details, include_path_deps) {
             SourceType::Shareable(source) => {
+                if let Some(names) = shareable_dep_names.as_deref_mut() {
+                    names.insert(name.clone());
+                }
                 let action = package_name2specs.entry(name.clone()).or_default();
                 if let Action::TryInherit(set) = action {
                     set.insert(source);
