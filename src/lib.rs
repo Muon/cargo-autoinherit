@@ -21,6 +21,9 @@ pub struct AutoInheritConf {
     /// Disables sorting the dependencies in the workspace.dependencies table.
     #[arg(long)]
     pub no_sort_workspace_deps: bool,
+    /// Also move path dependencies to [workspace.dependencies]. By default, path dependencies are left in place.
+    #[arg(long)]
+    pub include_path_deps: bool,
 }
 
 #[derive(Debug, Default)]
@@ -151,10 +154,13 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<(), anyhow::Error> {
             .chain(autoinherit_metadata.exclude_members),
     );
 
+    let include_path_deps = conf.include_path_deps;
     let mut package_name2specs: BTreeMap<String, Action> = BTreeMap::new();
     if let Some(deps) = &mut workspace.dependencies {
-        rewrite_dep_paths_as_absolute(deps.values_mut(), workspace_root);
-        process_deps(deps, &mut package_name2specs);
+        if include_path_deps {
+            rewrite_dep_paths_as_absolute(deps.values_mut(), workspace_root);
+        }
+        process_deps(deps, &mut package_name2specs, include_path_deps);
     }
 
     for member_id in graph.workspace().member_ids() {
@@ -171,45 +177,56 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<(), anyhow::Error> {
             toml::from_str(&contents).context("Failed to parse root manifest")?
         };
         if let Some(deps) = &mut manifest.dependencies {
-            rewrite_dep_paths_as_absolute(
-                deps.values_mut(),
-                package.manifest_path().parent().unwrap(),
-            );
-            process_deps(deps, &mut package_name2specs);
+            if include_path_deps {
+                rewrite_dep_paths_as_absolute(
+                    deps.values_mut(),
+                    package.manifest_path().parent().unwrap(),
+                );
+            }
+            process_deps(deps, &mut package_name2specs, include_path_deps);
         }
         if let Some(deps) = &mut manifest.dev_dependencies {
-            rewrite_dep_paths_as_absolute(
-                deps.values_mut(),
-                package.manifest_path().parent().unwrap(),
-            );
-            process_deps(deps, &mut package_name2specs);
+            if include_path_deps {
+                rewrite_dep_paths_as_absolute(
+                    deps.values_mut(),
+                    package.manifest_path().parent().unwrap(),
+                );
+            }
+            process_deps(deps, &mut package_name2specs, include_path_deps);
         }
         if let Some(deps) = &mut manifest.build_dependencies {
-            rewrite_dep_paths_as_absolute(
-                deps.values_mut(),
-                package.manifest_path().parent().unwrap(),
-            );
-            process_deps(deps, &mut package_name2specs);
+            if include_path_deps {
+                rewrite_dep_paths_as_absolute(
+                    deps.values_mut(),
+                    package.manifest_path().parent().unwrap(),
+                );
+            }
+            process_deps(deps, &mut package_name2specs, include_path_deps);
         }
     }
 
     let mut package_name2inherited_source: BTreeMap<String, SharedDependency> = BTreeMap::new();
     'outer: for (package_name, action) in package_name2specs {
-        let Action::TryInherit(specs) = action else {
-            eprintln!("`{package_name}` won't be auto-inherited because it appears at least once from a source type \
-                that we currently don't support (e.g. private registry, path dependency).");
-            continue;
-        };
-        if specs.len() > 1 {
-            eprintln!("`{package_name}` won't be auto-inherited because there are multiple sources for it:");
-            for spec in specs.into_iter() {
-                eprintln!("  - {}", spec.source);
+        match action {
+            Action::Skip => continue,
+            Action::SkipUnsupported => {
+                eprintln!("`{package_name}` won't be auto-inherited because it comes from a \
+                    source type that we currently don't support (e.g. private registry).");
+                continue;
             }
-            continue 'outer;
-        }
+            Action::TryInherit(specs) => {
+                if specs.len() > 1 {
+                    eprintln!("`{package_name}` won't be auto-inherited because there are multiple sources for it:");
+                    for spec in specs.into_iter() {
+                        eprintln!("  - {}", spec.source);
+                    }
+                    continue 'outer;
+                }
 
-        let spec = specs.into_iter().next().unwrap();
-        package_name2inherited_source.insert(package_name, spec);
+                let spec = specs.into_iter().next().unwrap();
+                package_name2inherited_source.insert(package_name, spec);
+            }
+        }
     }
 
     // Add new "shared" dependencies to `[workspace.dependencies]`
@@ -235,7 +252,9 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<(), anyhow::Error> {
             continue;
         } else {
             let mut dep = shared2dep(source);
-            rewrite_dep_path_as_relative(&mut dep, workspace_root);
+            if include_path_deps {
+                rewrite_dep_path_as_relative(&mut dep, workspace_root);
+            }
 
             insert_preserving_decor(workspace_deps, package_name, dep2toml_item(&dep));
             was_modified = true;
@@ -319,6 +338,7 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<(), anyhow::Error> {
 enum Action {
     TryInherit(MinimalVersionSet),
     Skip,
+    SkipUnsupported,
 }
 
 impl Default for Action {
@@ -411,9 +431,13 @@ fn insert_preserving_decor(table: &mut toml_edit::Table, key: &str, mut value: t
     table.insert_formatted(&new_key, value);
 }
 
-fn process_deps(deps: &DepsSet, package_name2specs: &mut BTreeMap<String, Action>) {
+fn process_deps(
+    deps: &DepsSet,
+    package_name2specs: &mut BTreeMap<String, Action>,
+    include_path_deps: bool,
+) {
     for (name, details) in deps {
-        match dep2shared_dep(details) {
+        match dep2shared_dep(details, include_path_deps) {
             SourceType::Shareable(source) => {
                 let action = package_name2specs.entry(name.clone()).or_default();
                 if let Action::TryInherit(set) = action {
@@ -421,8 +445,11 @@ fn process_deps(deps: &DepsSet, package_name2specs: &mut BTreeMap<String, Action
                 }
             }
             SourceType::Inherited => {}
-            SourceType::MustBeSkipped => {
+            SourceType::Skip => {
                 package_name2specs.insert(name.clone(), Action::Skip);
+            }
+            SourceType::Unsupported => {
+                package_name2specs.insert(name.clone(), Action::SkipUnsupported);
             }
         }
     }
@@ -490,10 +517,11 @@ impl std::fmt::Display for DependencySource {
 enum SourceType {
     Shareable(SharedDependency),
     Inherited,
-    MustBeSkipped,
+    Skip,
+    Unsupported,
 }
 
-fn dep2shared_dep(dep: &Dependency) -> SourceType {
+fn dep2shared_dep(dep: &Dependency, include_path_deps: bool) -> SourceType {
     match dep {
         Dependency::Simple(version) => {
             let version_req =
@@ -506,11 +534,13 @@ fn dep2shared_dep(dep: &Dependency) -> SourceType {
         Dependency::Inherited(_) => SourceType::Inherited,
         Dependency::Detailed(d) => {
             let mut source = None;
-            // We ignore custom registries for now.
             if d.registry.is_some() || d.registry_index.is_some() {
-                return SourceType::MustBeSkipped;
+                return SourceType::Unsupported;
             }
             if d.path.is_some() {
+                if !include_path_deps {
+                    return SourceType::Skip;
+                }
                 source = Some(DependencySource::Path {
                     path: d.path.as_ref().unwrap().to_owned(),
                     version: d.version.as_ref().map(|v| {
@@ -533,7 +563,7 @@ fn dep2shared_dep(dep: &Dependency) -> SourceType {
                 source = Some(DependencySource::Version(version_req));
             }
             match source {
-                None => SourceType::MustBeSkipped,
+                None => SourceType::Unsupported,
                 Some(source) => SourceType::Shareable(SharedDependency {
                     default_features: d.default_features.unwrap_or(true),
                     source,
